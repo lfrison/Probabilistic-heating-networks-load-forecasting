@@ -1,0 +1,20 @@
+name: prob-load-forecast-notebooks
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - jupyterlab
+  - notebook
+  - matplotlib
+  - pandas
+  - scikit-learn
+  - pytorch
+  - pip:
+      - tqdm
+      - seaborn
+      - pyyaml
+      - optuna
+      - statsmodels
+      - properscoring
