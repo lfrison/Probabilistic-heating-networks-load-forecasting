@@ -1,0 +1,9 @@
+jupyter
+ipykernel
+numpy
+pandas
+matplotlib
+scipy
+scikit-learn
+properscoring
+torch
