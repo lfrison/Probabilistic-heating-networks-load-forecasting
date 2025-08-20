@@ -89,8 +89,9 @@ conda activate se-notebooks
 | Model Variant                         | TEST MAE (MW) | TEST MAPE (%) |
 |--------------------------------------|---------------|---------------|
 | AEDL (deterministic point‑forecast)  | **13.28**     | **5.96**      |
-| AEDL‑Prob (Gaussian head)            | 13.71         | 9.37          |
-| AEDL‑Quant (quantile head)           | 13.64         | 8.42          |
+| AEDL‑Prob (Gaussian head)            | 13.7          | 9.13          |
+| AEDL‑Quant (quantile head)           | 13.59         | 8.2          |
+(Run time: each taking around 1 min per epoch, running for 33 - 48 epochs (with early stopping))
 
 ### What these numbers mean operationally
 - **MAE (MW)** — Average absolute MW deviation from truth. At **13.28 MW**, the deterministic AEDL provides the tightest point‑forecast, which directly supports **day‑ahead unit commitment and pump scheduling** with fewer manual corrections.

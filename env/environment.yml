@@ -1,19 +1,22 @@
-name: prob-load-forecast-notebooks
+name: dhn-predict
 channels:
-  - defaults
   - conda-forge
 dependencies:
   - python=3.10
   - pip
-  - jupyterlab
-  - notebook
-  - matplotlib
-  - pandas
-  - scikit-learn
-  - pytorch
+
+  # BLAS variant (optional, same notes as above)
+  # - libblas=*=*openblas
+  # - libblas=*=*openblas_ilp64
   - pip:
+      - torch==1.13.1
+      - numpy<2
+      - scipy
+      - pandas
+      - scikit-learn
+      - jupyterlab
+      - matplotlib
       - tqdm
-      - seaborn
       - pyyaml
       - optuna
       - statsmodels
