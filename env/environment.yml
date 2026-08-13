@@ -9,7 +9,7 @@ dependencies:
   # - libblas=*=*openblas
   # - libblas=*=*openblas_ilp64
   - pip:
-      - torch==1.13.1
+      - torch>=2.9.1
       - numpy<2
       - scipy
       - pandas
@@ -21,3 +21,5 @@ dependencies:
       - optuna
       - statsmodels
       - properscoring
+      - neuralforecast==3.2.0
+      - utilsforecast==0.2.16
