@@ -143,7 +143,6 @@ per-building normalization.
 | `--version` | `A` (window load scaling) or `B` (linear shortcut) | `A` |
 | `--baseline` | Paper baselines instead of a version: `plain` AEDL, `lstm`, or `lstm-ws` (LSTM with window scaling) | none |
 | `--calendar-tz` | Calendar features in a local time zone, e.g. `Europe/Berlin` | UTC |
-| `--fold` | Rolling-origin fold (`paper` only) | original split |
 | `--start-date` | First training origin | all data |
 | `--device` | `auto`, `cpu`, `cuda`, or `mps` | `auto` |
 | `--output-dir` | Result directory | `results/<protocol>/<version>/seed_<seed>/` |
@@ -152,31 +151,6 @@ JSON results and checkpoints record features, splits, scaling, calibration,
 metrics, and training history. Point results include MAE, RMSE, MAPE, MPE, and
 WAPE overall, for every lead time and month, and separately for the heating
 season (October to March) and summer (April to September).
-
-## Revised paper (proprietary data)
-
-[`src/scripts/paper_runs.sh`](src/scripts/paper_runs.sh) contains all runs of
-the revised manuscript (rolling folds 1 and 2, seeds 42 to 46) and the analysis
-that produces its tables and figures:
-
-```bash
-bash src/scripts/paper_runs.sh aedl
-bash src/scripts/paper_runs.sh baselines
-bash src/scripts/paper_runs.sh start
-bash src/scripts/paper_runs.sh hpo
-bash src/scripts/paper_runs.sh analysis
-```
-
-| Script | Content |
-|---|---|
-| `run_experiments.py` | AEDL versions A and B and the plain AEDL and LSTM baselines |
-| `run_simple_baselines.py` | Seasonal naive and its probabilistic version |
-| `run_tft.py` | TFT (NeuralForecast) on the same forecast windows |
-| `tune_hpo.py` | Optuna hyperparameter search for A, B, and TFT |
-| `benchmark_compute.py` | Parameters, FLOPs, memory, training time, and latency |
-| `paper_data.py` | Missing-data shares, correlations, and data figures |
-| `paper_predictions.py` | Metrics by lead time, forecast example, and reliability diagram |
-| `paper_latex_tables.py` | Result tables in LaTeX |
 
 ## Network-expansion evaluation
 

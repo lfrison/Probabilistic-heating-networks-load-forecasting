@@ -24,3 +24,18 @@ notebooks/Ulm/
 build/
 dist/
 *.egg-info/
+
+# Paper analysis scripts and private data processing. They need the proprietary
+# data and are kept locally only.
+src/scripts/paper_*
+src/scripts/run_simple_baselines.py
+src/scripts/tune_hpo.py
+src/scripts/benchmark_compute.py
+src/data_processing/
+
+# Private manuscript, other projects, and local outputs.
+Paper/
+EuroSun_2026/
+nixtla-nhits/
+figures/
+.claude/
