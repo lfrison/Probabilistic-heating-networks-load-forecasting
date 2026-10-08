@@ -237,8 +237,8 @@ def train_model(
         print(
             f"{case.weather_case:>15} | {model_name:>13} | epoch {epoch:02d} | "
             f"loss {epoch_record['train_loss']:.5f} | val MAE {current_mae:.2f} kW | "
-            f"val CRPS {scores['crps']:.2f} kW | "
-            f"epoch {epoch_minutes:.2f} min | elapsed {elapsed_minutes:.2f} min"
+            + (f"val CRPS {scores['crps']:.2f} kW | " if select_on_crps else "")
+            + f"epoch {epoch_minutes:.2f} min | elapsed {elapsed_minutes:.2f} min"
         )
 
         if on_epoch is not None:
@@ -465,6 +465,17 @@ def model_variant_name(data_cfg: DataConfig, variant: str) -> str:
     return "_".join([*parts, variant])
 
 
+def summary_line(label: str, metrics: dict[str, object]) -> str:
+    """Test MAE and MAPE, plus CRPS and coverage of the calibrated intervals."""
+
+    point = metrics["point"]
+    line = f"{label:<40} MAE {point['mae_kw']:7.1f} kW | MAPE {point['mape_percent']:5.2f} %"
+    if "probabilistic_calibrated" in metrics:
+        prob = metrics["probabilistic_calibrated"]
+        line += f" | CRPS {prob['crps_shared_quantile_grid_kw']:7.1f} kW | PICP80 {prob['picp80']:.2f}"
+    return line
+
+
 def expand_selection(values: list[str], allowed: tuple[str, ...]) -> list[str]:
     if "all" in values:
         return list(allowed)
@@ -653,6 +664,7 @@ def main() -> None:
     device = resolve_device(args.device)
     print(f"Training on {device}")
     all_results: list[dict[str, object]] = []
+    summary_lines: list[str] = []
     total_runs = len(prepared_runs) * len(models)
     completed_runs = 0
     experiment_started = time.time()
@@ -693,10 +705,11 @@ def main() -> None:
                 experiment_cfg,
                 device,
             )
-            print(
-                f"{case.weather_case} / {normalization_name} / "
-                f"{model_name}: {metrics}"
+            label = " / ".join(
+                [case.weather_case, *([normalization_name] if multiple_normalizations else []), model_name]
             )
+            summary_lines.append(summary_line(label, metrics))
+            print(summary_lines[-1])
             save_run(
                 output_dir=output_dir,
                 model_name=model_name,
@@ -750,6 +763,8 @@ def main() -> None:
     )
     total_minutes = (time.time() - experiment_started) / 60.0
     print(f"All {total_runs} runs completed in {total_minutes:.2f} min.")
+    print(f"\nTest results ({output_dir}):")
+    print("\n".join(summary_lines))
 
 
 if __name__ == "__main__":

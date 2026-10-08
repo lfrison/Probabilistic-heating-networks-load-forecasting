@@ -74,7 +74,9 @@ python src/scripts/run_experiments.py --protocol ulm --version B
 python src/scripts/run_tft.py --protocol ulm --seeds 42
 ```
 
-Each AEDL command trains the three heads in about half an hour on a laptop. Add
+Each AEDL command trains the three heads in about half an hour on a laptop and
+ends with a summary of the test results (MAE, MAPE, and for the probabilistic
+heads CRPS and PICP80 of the calibrated intervals). Add
 `--seed <n>` for further seeds and `--epochs 1` for a quick smoke test. Results
 are written to `results/ulm/A/seed_<seed>/`, `results/ulm/B/seed_<seed>/`, and
 `results/ulm/tft/seed_<seed>/`.
