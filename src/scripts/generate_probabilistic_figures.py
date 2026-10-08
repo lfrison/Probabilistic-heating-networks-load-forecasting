@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Directory containing the Gaussian and quantile checkpoints. "
-            "Default: results/<protocol>/seed_<seed>."
+            "Default: results/<protocol>/<version>/seed_<seed>."
         ),
     )
     parser.add_argument(
@@ -83,6 +83,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--version", choices=("A", "B"), default="A")
     parser.add_argument(
         "--data-path",
         type=Path,
@@ -191,13 +192,15 @@ def build_checkpoint_model(
     model = build_model(
         model_name,
         n_past_features=len(case.past_cols),
-        future_dim=len(case.future_cols),
+        future_dim=case.test_dataset.future.shape[-1],
         hidden_size=experiment_cfg.hidden_size,
         num_layers=experiment_cfg.num_layers,
         attention_heads=experiment_cfg.attn_heads,
         dropout=experiment_cfg.dropout,
         pred_len=case.test_dataset.pred_len,
         quantiles=experiment_cfg.quantiles,
+        output_skip=experiment_cfg.output_skip,
+        architecture=experiment_cfg.architecture,
     )
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.to(device).eval()
@@ -401,19 +404,10 @@ def main() -> None:
             f"Protocol {protocol.name!r} does not support {args.weather_case!r}. "
             f"Allowed: {protocol.allowed_weather_cases}."
         )
-    default_result_group = ROOT / "results" / protocol.name
+    default_result_group = ROOT / "results" / protocol.name / args.version
     if args.weather_case not in protocol.weather_cases:
         default_result_group = default_result_group / args.weather_case
     results_dir = args.results_dir or default_result_group / f"seed_{args.seed}"
-    legacy_ulm_dir = ROOT / "results" / "observed_future" / f"seed_{args.seed}"
-    if (
-        args.results_dir is None
-        and protocol.name == "ulm"
-        and args.weather_case == "observed_future"
-        and not results_dir.exists()
-        and legacy_ulm_dir.exists()
-    ):
-        results_dir = legacy_ulm_dir
     file_prefix = "api" if args.weather_case == "api_forecast" else args.weather_case
     plt.rcParams.update(
         {

@@ -1,0 +1,26 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.matplotlib-cache/
+
+# Only the redistributable Ulm source and its documentation are public data.
+data/*
+!data/data_Ulm.csv
+!data/README.md
+results/
+*.pt
+
+# Local editor and operating-system artifacts.
+*.textClipping
+
+# Superseded exploratory notebooks kept locally for reference.
+notebooks/best-v*/
+notebooks/Ulm/
+
+# Build and packaging outputs.
+build/
+dist/
+*.egg-info/

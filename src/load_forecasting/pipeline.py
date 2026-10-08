@@ -49,14 +49,25 @@ class DataConfig:
     origin_stride: int = 1
     interpolate_limit: int = 2
 
+    # Decoder inputs: calendar features of the target hours, and load and
+    # weather 24 h before each target hour (both known at the forecast origin).
+    decoder_calendar: bool = True
+    decoder_lag24: bool = True
+    # Calendar features in local time (e.g. "Europe/Berlin") instead of UTC.
+    calendar_timezone: str | None = None
+    # Date-based validation start (paper folds); default: last val_fraction.
+    validation_start: str | None = None
+    # Version A: divide the load of each window by the mean load of its history.
+    window_load_scaling: bool = False
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    hidden_size: int = 128
-    num_layers: int = 2
+    hidden_size: int = 96
+    num_layers: int = 1
     attn_heads: int = 8
     dropout: float = 0.2
-    lr: float = 1e-4
+    lr: float = 3e-4
     weight_decay: float = 1e-2
     grad_clip: float = 1.0
     epochs: int = 50
@@ -65,6 +76,8 @@ class ExperimentConfig:
     quantiles: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
     quantile_width_weight: float = 5e-4
     quantile_median_weight: float = 0.5
+    output_skip: str = "none"  # "none" or "linear" (version B)
+    architecture: str = "aedl"  # "aedl" or "lstm" (plain LSTM baseline)
     seed: int = 42
 
 
@@ -187,9 +200,13 @@ def future_columns_by_horizon(
     raise ValueError(f"Unknown weather case {weather_case!r}; choose from {WEATHER_CASES}.")
 
 
-def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_calendar_features(df: pd.DataFrame, timezone: str | None = None) -> pd.DataFrame:
+    """Add cyclic calendar features; the index is naive UTC."""
+
     out = df.copy()
     dt = out.index
+    if timezone:
+        dt = dt.tz_localize("UTC").tz_convert(timezone)
     hour = dt.hour + dt.minute / 60.0
     out["h_sin"] = np.sin(2.0 * np.pi * hour / 24.0)
     out["h_cos"] = np.cos(2.0 * np.pi * hour / 24.0)
@@ -266,7 +283,7 @@ def _load_combined_dataframe(cfg: DataConfig) -> pd.DataFrame:
             limit_area="inside",
         )
     keep = [*required, *[column for column in df.columns if column in CALENDAR_COLS]]
-    return add_calendar_features(df[list(dict.fromkeys(keep))])
+    return add_calendar_features(df[list(dict.fromkeys(keep))], cfg.calendar_timezone)
 
 
 def _load_legacy_dataframe(cfg: DataConfig) -> pd.DataFrame:
@@ -321,7 +338,7 @@ def _load_legacy_dataframe(cfg: DataConfig) -> pd.DataFrame:
     complete_index = pd.date_range(start, end, freq="h")
     df = consumption.reindex(complete_index).join(weather.reindex(complete_index), how="left")
     df.index.name = "timestamp"
-    return add_calendar_features(df)
+    return add_calendar_features(df, cfg.calendar_timezone)
 
 
 def past_feature_columns(
@@ -616,14 +633,19 @@ def _build_legacy_split_origins(
             "Not enough complete training windows after applying date and gap filters."
         )
 
-    split_idx = int((1.0 - cfg.val_fraction) * len(train_pool))
-    split_idx = min(max(split_idx, 1), len(train_pool) - 1)
-    validation_start = pd.Timestamp(df.index[train_pool[split_idx]])
+    if cfg.validation_start:
+        validation_start = pd.Timestamp(cfg.validation_start)
+        if not (df.index[train_pool] >= validation_start).any():
+            raise ValueError("No validation origins after validation_start.")
+    else:
+        split_idx = int((1.0 - cfg.val_fraction) * len(train_pool))
+        split_idx = min(max(split_idx, 1), len(train_pool) - 1)
+        validation_start = pd.Timestamp(df.index[train_pool[split_idx]])
 
     # Prevent overlapping train and validation targets. Past context before the
     # validation boundary remains allowed, as it would be at forecast time.
     train = train_pool[df.index[train_pool + cfg.pred_len - 1] < validation_start]
-    validation = train_pool[train_pool >= train_pool[split_idx]]
+    validation = train_pool[df.index[train_pool] >= validation_start]
     test = valid_origins(
         df,
         target_start=pd.Timestamp(cfg.test_start),
@@ -695,8 +717,12 @@ class ForecastWindowDataset(Dataset):
         past_len: int,
         pred_len: int,
         batch_size: int,
+        decoder_calendar: bool = False,
+        decoder_lag24_cols: Sequence[str] = (),
+        window_load_scaling: bool = False,
     ):
         self.origins = np.asarray(origins, dtype=np.int64)
+        self.window_load_scaling = bool(window_load_scaling)
         self.past_len = int(past_len)
         self.pred_len = int(pred_len)
         self.batch_size = int(batch_size)
@@ -720,6 +746,25 @@ class ForecastWindowDataset(Dataset):
         self.target = target.astype(np.float32)
         self.target_multiplier = target_multiplier.reshape(-1).astype(np.float32)
 
+        target_rows = self.origins[:, None] + np.arange(self.pred_len)[None, :]
+        if self.window_load_scaling:
+            # Per-origin windows: load divided by the mean load of the history.
+            past_rows = self.origins[:, None] + np.arange(-self.past_len, 0)[None, :]
+            load = target_raw.reshape(-1)
+            level = load[past_rows].mean(axis=1)
+            if not np.all(np.isfinite(level)) or np.any(level <= 0):
+                raise ValueError("Window load scaling needs a positive, complete load history.")
+            self.past_windows = self.past[past_rows].copy()
+            self.past_windows[..., self.target_index] = scaler_target.transform(
+                (load[past_rows] / level[:, None]).reshape(-1, 1)
+            ).reshape(past_rows.shape)
+            self.target_windows = scaler_target.transform(
+                (load[target_rows] / level[:, None]).reshape(-1, 1)
+            ).reshape(target_rows.shape).astype(np.float32)
+            self.multiplier_windows = np.repeat(level[:, None], self.pred_len, axis=1).astype(
+                np.float32
+            )
+
         if len(future_cols_by_horizon) != self.pred_len:
             raise ValueError("Future source columns must have one entry per decoder step.")
         if future_cols:
@@ -738,10 +783,34 @@ class ForecastWindowDataset(Dataset):
         else:
             self.future = np.zeros((len(self.origins), self.pred_len, 0), dtype=np.float32)
 
+        # Extra decoder inputs reuse the scaled encoder features.
+        extras = []
+        if decoder_calendar:
+            calendar_index = [list(past_cols).index(column) for column in CALENDAR_COLS]
+            extras.append(self.past[target_rows][..., calendar_index])
+        if decoder_lag24_cols:
+            lag_index = [list(past_cols).index(column) for column in decoder_lag24_cols]
+            if self.window_load_scaling:
+                start = self.past_len - 24
+                extras.append(
+                    self.past_windows[:, start : start + self.pred_len][..., lag_index]
+                )
+            else:
+                extras.append(self.past[target_rows - 24][..., lag_index])
+        if extras:
+            self.future = np.concatenate([self.future, *extras], axis=-1).astype(np.float32)
+
     def __len__(self) -> int:
         return len(self.origins)
 
     def __getitem__(self, item: int):
+        if self.window_load_scaling:
+            return (
+                torch.from_numpy(self.past_windows[item]),
+                torch.from_numpy(self.future[item]),
+                torch.from_numpy(self.target_windows[item]),
+                torch.from_numpy(self.multiplier_windows[item]),
+            )
         origin = int(self.origins[item])
         return (
             torch.from_numpy(self.past[origin - self.past_len : origin]),
@@ -790,6 +859,14 @@ def prepare_case(
     target_fit_rows = train_rows[np.isfinite(target_raw[train_rows]).reshape(-1)]
     scaler_past = StandardScaler().fit(past_raw[past_fit_rows])
     scaler_target = StandardScaler().fit(target_raw[target_fit_rows])
+    if data_cfg.window_load_scaling:
+        if data_cfg.target_normalization_col:
+            raise ValueError("Version A cannot be combined with per-building normalization. Use version B.")
+        # Target scaler on the load ratios of the training windows.
+        rows = origins.train[:, None] + np.arange(-data_cfg.past_len, data_cfg.pred_len)[None, :]
+        load = target_raw.reshape(-1)[rows]
+        ratios = load / load[:, : data_cfg.past_len].mean(axis=1, keepdims=True)
+        scaler_target = StandardScaler().fit(ratios.reshape(-1, 1))
 
     scaler_future: StandardScaler | None = None
     if future_cols:
@@ -819,6 +896,13 @@ def prepare_case(
         past_len=data_cfg.past_len,
         pred_len=data_cfg.pred_len,
         batch_size=data_cfg.batch_size,
+        decoder_calendar=data_cfg.decoder_calendar,
+        decoder_lag24_cols=(
+            (data_cfg.target_col, *data_cfg.weather_columns)
+            if data_cfg.decoder_lag24
+            else ()
+        ),
+        window_load_scaling=data_cfg.window_load_scaling,
     )
     return PreparedCase(
         weather_case=weather_case,

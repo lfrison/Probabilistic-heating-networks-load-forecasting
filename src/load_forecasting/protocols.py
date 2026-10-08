@@ -10,6 +10,24 @@ from load_forecasting.pipeline import DataConfig, ROOT, WEATHER_CASES
 
 MODEL_NAMES = ("deterministic", "gaussian", "quantile")
 
+# Rolling-origin folds of the paper protocol. Each fold trains on all data
+# before its validation period. No weather data exist from mid-May to early
+# October 2025.
+PAPER_FOLDS = {
+    1: dict(
+        validation_start="2025-01-01 00:00",
+        train_end="2025-05-31 23:00",
+        test_start="2025-10-01 00:00",
+        test_end="2026-01-31 23:00",
+    ),
+    2: dict(
+        validation_start="2025-10-01 00:00",
+        train_end="2026-01-31 23:00",
+        test_start="2026-02-01 00:00",
+        test_end="2026-04-30 23:00",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class ExperimentProtocol:

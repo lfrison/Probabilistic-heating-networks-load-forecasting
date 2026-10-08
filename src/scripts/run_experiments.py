@@ -7,6 +7,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -18,7 +19,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from scipy.stats import norm
+
 from load_forecasting.metrics import (
+    pinball_loss,
     expand_quantiles,
     fit_gaussian_scale_calibration,
     fit_quantile_interval_calibration,
@@ -45,6 +49,7 @@ from load_forecasting.pipeline import (
 )
 from load_forecasting.protocols import (
     MODEL_NAMES,
+    PAPER_FOLDS,
     PROTOCOLS,
     get_protocol,
 )
@@ -81,33 +86,53 @@ def quantile_pinball_torch(
 
 
 @torch.no_grad()
-def validation_mae(
+def validation_scores(
     model_name: str,
     model: nn.Module,
     loader,
     case: PreparedCase,
     device: torch.device,
-) -> float:
+    quantiles: Sequence[float],
+) -> dict[str, float]:
+    """Validation MAE and, for probabilistic heads, raw nine-quantile CRPS [kW]."""
+
     model.eval()
-    absolute_error = 0.0
+    levels = np.asarray(quantiles, dtype=float)
+    z_values = norm.ppf(levels)
+    absolute_error = crps_sum = 0.0
     count = 0
     for past, future, target, multiplier in loader:
         past, future = past.to(device), future.to(device)
+        multiplier = multiplier.numpy()
+        target_kw = inverse_target(target.numpy(), case.scaler_target, multiplier)
+        quantile_kw = None
         if model_name == "deterministic":
             prediction = model(past, future)
         elif model_name == "gaussian":
-            prediction, _ = model(past, future)
+            prediction, log_scale = model(past, future)
+            mean_kw = inverse_target(prediction.cpu().numpy(), case.scaler_target, multiplier)
+            scale_kw = (
+                np.exp(log_scale.cpu().numpy()) * float(case.scaler_target.scale_[0]) * multiplier
+            )
+            quantile_kw = mean_kw[..., None] + scale_kw[..., None] * z_values
         else:
-            quantile_values = model(past, future)
-            prediction = quantile_values[..., model.median_index]
-        multiplier = multiplier.numpy()
+            values = model(past, future)
+            prediction = values[..., model.median_index]
+            repeated = np.repeat(multiplier[..., None], values.shape[-1], axis=-1)
+            quantile_kw = inverse_target(
+                values.cpu().numpy().reshape(-1, 1), case.scaler_target, repeated.reshape(-1, 1)
+            ).reshape(values.shape)
         prediction_kw = inverse_target(
             prediction.detach().cpu().numpy(), case.scaler_target, multiplier
         )
-        target_kw = inverse_target(target.numpy(), case.scaler_target, multiplier)
         absolute_error += float(np.abs(prediction_kw - target_kw).sum())
+        if quantile_kw is not None:
+            crps_sum += float(2.0 * pinball_loss(target_kw, quantile_kw, levels).mean(axis=-1).sum())
         count += int(target_kw.size)
-    return absolute_error / count
+    return {
+        "mae": absolute_error / count,
+        "crps": crps_sum / count if model_name != "deterministic" else float("nan"),
+    }
 
 
 def train_model(
@@ -116,7 +141,11 @@ def train_model(
     case: PreparedCase,
     cfg: ExperimentConfig,
     device: torch.device,
+    on_epoch=None,
 ) -> tuple[nn.Module, dict[str, object]]:
+    """Early stopping on validation MAE (deterministic head) or validation CRPS
+    (probabilistic heads). ``on_epoch(epoch, mae)`` allows HPO pruning."""
+
     train_loader, validation_loader, _ = case.loaders(seed=cfg.seed)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -131,7 +160,10 @@ def train_model(
     total_steps = max(1, len(train_loader) * cfg.epochs)
     quantiles_t = torch.as_tensor(cfg.quantiles, dtype=torch.float32, device=device)
 
-    best_mae = float("inf")
+    select_on_crps = model_name != "deterministic"
+    best_score = float("inf")
+    best_mae = best_crps = float("nan")
+    best_epoch = 0
     best_state = copy.deepcopy(model.state_dict())
     wait = 0
     global_step = 0
@@ -154,10 +186,15 @@ def train_model(
                 loss = torch.abs(prediction - target).mean()
             elif model_name == "gaussian":
                 warmup = epoch <= cfg.gaussian_warmup_epochs
-                mean, log_scale = model(past, future)
                 if warmup:
-                    loss = torch.abs(mean - target).mean()
+                    # Backbone and mean head learn from MAE only; the scale head
+                    # learns from the Gaussian loss on detached inputs.
+                    mean, log_scale = model(past, future, detach_scale_features=True)
+                    loss = torch.abs(mean - target).mean() + gaussian_dual_loss(
+                        mean.detach(), log_scale, target
+                    )
                 else:
+                    mean, log_scale = model(past, future)
                     loss = gaussian_dual_loss(mean, log_scale, target)
             else:
                 values = model(past, future)
@@ -178,17 +215,20 @@ def train_model(
             sample_count += len(past)
 
         scheduler.step()
-        current_mae = validation_mae(
+        scores = validation_scores(
             model_name,
             model,
             validation_loader,
             case,
             device,
+            cfg.quantiles,
         )
+        current_mae = scores["mae"]
         epoch_record = {
             "epoch": epoch,
             "train_loss": accumulated_loss / max(sample_count, 1),
             "validation_mae_kw": current_mae,
+            "validation_crps_kw": scores["crps"],
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
         history.append(epoch_record)
@@ -197,11 +237,16 @@ def train_model(
         print(
             f"{case.weather_case:>15} | {model_name:>13} | epoch {epoch:02d} | "
             f"loss {epoch_record['train_loss']:.5f} | val MAE {current_mae:.2f} kW | "
+            f"val CRPS {scores['crps']:.2f} kW | "
             f"epoch {epoch_minutes:.2f} min | elapsed {elapsed_minutes:.2f} min"
         )
 
-        if current_mae < best_mae - 0.05:
-            best_mae = current_mae
+        if on_epoch is not None:
+            on_epoch(epoch, current_mae)
+        score = scores["crps"] if select_on_crps else current_mae
+        if score < best_score - 0.05:
+            best_score = score
+            best_mae, best_crps, best_epoch = current_mae, scores["crps"], epoch
             best_state = copy.deepcopy(model.state_dict())
             wait = 0
         else:
@@ -213,6 +258,9 @@ def train_model(
     model.eval()
     return model, {
         "best_validation_mae_kw": best_mae,
+        "best_validation_crps_kw": best_crps,
+        "best_epoch": best_epoch,
+        "selection_metric": "crps" if select_on_crps else "mae",
         "epochs_completed": len(history),
         "elapsed_minutes": (time.time() - started) / 60.0,
         "history": history,
@@ -236,69 +284,51 @@ def evaluate_model(
     )
     test = collect_predictions(model_name, model, test_loader, case, device)
     y = test["target_kw"]
-    shared_quantiles = np.asarray(cfg.quantiles, dtype=float)
+    quantiles = np.asarray(cfg.quantiles, dtype=float)
 
+    probabilistic: dict[str, object] = {}
     if model_name == "deterministic":
         prediction = test["prediction_kw"]
-        metrics = {
-            "point": point_metrics(y, prediction),
-            "point_breakdown": point_metric_breakdown(y, prediction, case),
-        }
-        return metrics, point_forecast_frame(y, prediction, case)
-
-    if model_name == "gaussian":
-        point = point_metrics(y, test["mean_kw"])
-        raw = gaussian_quality_metrics(
-            y,
-            test["mean_kw"],
-            test["scale_kw"],
-            shared_quantiles,
-        )
+        calibration: dict[str, float] = {}
+    elif model_name == "gaussian":
+        prediction = test["mean_kw"]
         calibration_scale = fit_gaussian_scale_calibration(
             validation["target_kw"],
             validation["mean_kw"],
             validation["scale_kw"],
         )
-        calibrated = gaussian_quality_metrics(
-            y,
-            test["mean_kw"],
-            test["scale_kw"] * calibration_scale,
-            shared_quantiles,
-        )
-        metrics = {
-            "point": point,
-            "point_breakdown": point_metric_breakdown(
-                y, test["mean_kw"], case
+        calibration = {"sigma_scale": calibration_scale}
+        mean, scale = test["mean_kw"], test["scale_kw"]
+        probabilistic = {
+            "probabilistic_raw": gaussian_quality_metrics(y, mean, scale, quantiles),
+            "probabilistic_calibrated": gaussian_quality_metrics(
+                y, mean, scale * calibration_scale, quantiles
             ),
-            "probabilistic_raw": raw,
-            "probabilistic_calibrated": calibrated,
-            "calibration": {"sigma_scale": calibration_scale},
         }
-        return metrics, point_forecast_frame(y, test["mean_kw"], case)
 
-    quantiles = np.asarray(cfg.quantiles, dtype=float)
-    median_index = int(np.argmin(np.abs(quantiles - 0.5)))
-    point = point_metrics(y, test["quantiles_kw"][..., median_index])
-    raw = quantile_quality_metrics(y, test["quantiles_kw"], quantiles)
-    delta = fit_quantile_interval_calibration(
-        validation["target_kw"],
-        validation["quantiles_kw"],
-        quantiles,
-    )
-    calibrated_values = expand_quantiles(test["quantiles_kw"], quantiles, delta)
-    calibrated = quantile_quality_metrics(y, calibrated_values, quantiles)
-    metrics = {
-        "point": point,
-        "point_breakdown": point_metric_breakdown(
-            y, test["quantiles_kw"][..., median_index], case
-        ),
-        "probabilistic_raw": raw,
-        "probabilistic_calibrated": calibrated,
-        "calibration": {"symmetric_delta_kw": delta},
+    else:
+        median_index = int(np.argmin(np.abs(quantiles - 0.5)))
+        prediction = test["quantiles_kw"][..., median_index]
+        delta = fit_quantile_interval_calibration(
+            validation["target_kw"],
+            validation["quantiles_kw"],
+            quantiles,
+        )
+        calibration = {"symmetric_delta_kw": delta}
+        calibrated_values = expand_quantiles(test["quantiles_kw"], quantiles, delta)
+        probabilistic = {
+            "probabilistic_raw": quantile_quality_metrics(y, test["quantiles_kw"], quantiles),
+            "probabilistic_calibrated": quantile_quality_metrics(y, calibrated_values, quantiles),
+        }
+
+    metrics: dict[str, object] = {
+        "point": point_metrics(y, prediction),
+        "point_breakdown": point_metric_breakdown(y, prediction, case),
+        **probabilistic,
     }
-    return metrics, point_forecast_frame(
-        y, test["quantiles_kw"][..., median_index], case
-    )
+    if calibration:
+        metrics["calibration"] = calibration
+    return metrics, point_forecast_frame(y, prediction, case)
 
 
 def point_forecast_frame(
@@ -416,6 +446,25 @@ def save_run(
         )
 
 
+# Model choices of the command line: versions A and B and the paper baselines.
+VARIANTS = {
+    "A": dict(window_load_scaling=True),
+    "B": dict(output_skip="linear"),
+    "plain": dict(decoder_lag24=False),
+    "lstm": dict(decoder_lag24=False, architecture="lstm"),
+    "lstm-ws": dict(decoder_lag24=False, architecture="lstm", window_load_scaling=True),
+}
+
+
+def model_variant_name(data_cfg: DataConfig, variant: str) -> str:
+    parts = []
+    if data_cfg.start_date:
+        parts.append(f"from{pd.Timestamp(data_cfg.start_date):%Y-%m-%d}")
+    if data_cfg.calendar_timezone:
+        parts.append("localcal")
+    return "_".join([*parts, variant])
+
+
 def expand_selection(values: list[str], allowed: tuple[str, ...]) -> list[str]:
     if "all" in values:
         return list(allowed)
@@ -448,6 +497,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--version", choices=("A", "B"), default="A",
+        help="A: load of each window divided by its 48 h mean. B: linear shortcut from the last 24 h of load.",
+    )
+    parser.add_argument(
+        "--baseline", choices=("plain", "lstm", "lstm-ws"), default=None,
+        help="Paper baselines instead of a version: plain AEDL, plain LSTM, LSTM with window scaling.",
+    )
+    parser.add_argument(
+        "--fold",
+        type=int,
+        choices=tuple(PAPER_FOLDS),
+        default=None,
+        help="Paper protocol only. 1: test Oct 2025-Jan 2026, 2: test Feb-Apr 2026. "
+        "Default: original manuscript split.",
+    )
+    parser.add_argument(
+        "--start-date", default=None, help="First training origin, e.g. 2023-01-01 (default: all data)."
+    )
+    parser.add_argument(
+        "--calendar-tz",
+        default=None,
+        help="Compute calendar features in this time zone, e.g. Europe/Berlin (default: UTC).",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--output-dir",
@@ -496,12 +569,25 @@ def main() -> None:
         selected_weather_cases=tuple(comparison_cases),
         common_windows=common_windows,
     )
+    if args.fold is not None:
+        if protocol.name != "paper":
+            raise ValueError("--fold is only defined for the paper protocol.")
+        base_data_cfg = replace(base_data_cfg, **PAPER_FOLDS[args.fold])
+    if args.start_date is not None:
+        base_data_cfg = replace(base_data_cfg, start_date=args.start_date)
+    if args.calendar_tz is not None:
+        base_data_cfg = replace(base_data_cfg, calendar_timezone=args.calendar_tz)
+    variant = args.baseline or args.version
+    choice = VARIANTS[variant]
+    data_fields = {key: value for key, value in choice.items() if key in ("window_load_scaling", "decoder_lag24")}
+    base_data_cfg = replace(base_data_cfg, **data_fields)
     epochs = protocol.epochs if args.epochs is None else args.epochs
     seed = protocol.seed if args.seed is None else args.seed
     experiment_cfg = replace(
         ExperimentConfig(),
         epochs=epochs,
         seed=seed,
+        **{key: value for key, value in choice.items() if key in ("output_skip", "architecture")},
     )
 
     seed_everything(experiment_cfg.seed)
@@ -541,6 +627,10 @@ def main() -> None:
 
     is_default_weather = tuple(weather_cases) == protocol.weather_cases
     result_group = ROOT / "results" / protocol.name
+    folder = model_variant_name(base_data_cfg, variant)
+    if args.fold is not None:
+        folder = f"fold{args.fold}_{folder}"
+    result_group = result_group / folder
     if not is_default_weather:
         result_group = result_group / "_".join(weather_cases)
     output_dir = args.output_dir or result_group / f"seed_{seed}"
@@ -578,13 +668,16 @@ def main() -> None:
             model = build_model(
                 model_name,
                 n_past_features=len(case.past_cols),
-                future_dim=len(case.future_cols),
+                future_dim=case.train_dataset.future.shape[-1],
                 hidden_size=experiment_cfg.hidden_size,
                 num_layers=experiment_cfg.num_layers,
                 attention_heads=experiment_cfg.attn_heads,
                 dropout=experiment_cfg.dropout,
                 pred_len=data_cfg.pred_len,
                 quantiles=experiment_cfg.quantiles,
+                output_skip=experiment_cfg.output_skip,
+                target_index=case.past_cols.index(data_cfg.target_col),
+                architecture=experiment_cfg.architecture,
             ).to(device)
             model, training = train_model(
                 model_name,
